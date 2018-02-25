@@ -1,110 +1,214 @@
-"""
-NeoSense Smart Contract based Licensing
-Created by Dean van Dugteren (City of Zion, VDT Network)
-hello@dean.press
-"""
-
-from boa.blockchain.vm.Neo.Runtime import CheckWitness
+from boa.blockchain.vm.Neo.Blockchain import GetHeight
 from boa.blockchain.vm.Neo.Storage import GetContext, Put, Delete, Get
-from boa.code.builtins import concat
+from contract.helpers.serialize import serialize_array, serialize_var_length_item
+from contract.helpers.utils import is_owner
+from boa.code.builtins import list, concat
+from contract.product import init_product, get_all_product
+from contract.license import init_license, get_all_license_data
 
 
-def is_owner(product_id):
+def register_product(args):
     """
-    Verify that the product is owned by the requesting user.
-    """
-    print('Am I the product owner?')
-    product_owner = Get(GetContext, product_id)
-    is_product_owner = CheckWitness(product_owner)
-    if not is_product_owner:
-        print('Not the product owner!')
-    return is_product_owner
+    :param args:
+        args[0]: senderhash
+        args[1]: product id (something unique)
+        args[2]: description (human readable description of the product, keep as short as possible to keep gas price as
+                 low as possible)
+        args[3]: max_license_number;
+        args[4]: make transferable;
+        args[5]: product_expiration; blockheight at which the product is expired (no more licences will be distributed)
+        args[6]: license_expiration; number of blocks for which a license is valid
+        args[7]: autosell (bool)
+        args[8]: price (gas)
 
-# Main Operation
+    :return: bool
+    """
+
+    product_id = args[1]
+    product_exists = Get(GetContext, product_id)
+    product_data = list(length=8)
+
+    product_data[0] = args[0]
+    product_data[2] = args[2]
+    product_data[3] = args[3]
+    product_data[4] = args[4]
+    product_data[5] = args[5]
+    product_data[6] = args[6]
+    # this is the total amount sold
+    product_data[7] = 0
+    product_data[8] = args[7]
+    product_data[9] = args[8]
+
+    if not product_exists:
+        serialized_product_data = serialize_array(args)
+        Put(GetContext, product_id, serialized_product_data)
+        print("product registered")
+        return True
+    else:
+        print("product already exists")
+        return
+
+
+def license_product(args):
+    """
+    Grant a license for a specific product, can only be called by the product owner:
+    :param args:
+        args[0]: product_id
+        args[1]: user_id (user public key)
+
+    :return: bool
+    """
+    # unpacking args
+    product_id = args[0]
+    user_id = args[1]
+
+    if not is_owner(product_id):
+        return False
+
+    product = init_product(product_id)
+
+    height = GetHeight()
+    product_expiration = product.pe
+
+    # check if the product can still be licensed
+    if height > product_expiration:
+        print('This product cannot be licensed anymore, it has expired')
+        return False
+
+    # check if there are still licenses available
+    max_license_number = product.mln
+    current_licenses = product.cln
+
+    if current_licenses == max_license_number:
+        print('licenses have been sold out!')
+        return False
+
+    license_id = concat(product_id, user_id)
+
+    # block height at which the license expires
+    license_duration = product.le
+    license_expiration = height + license_duration
+
+    license_data = list(length=3)
+
+    license_data[0] = user_id
+    license_data[1] = license_expiration
+    license_data[2] = product_id
+
+    Put(GetContext, license_id, license_data)
+    cln = increment_cln(product_id)
+
+    return True
+
+
+def increment_cln(product_id):
+    """
+    :param product_id:
+    :return: bool
+    """
+    if not is_owner(product_id):
+        return False
+
+    product = init_product(product_id)
+
+    # increment the cln
+    current_cln = product.cln
+    new_cln = current_cln + 1
+    all_product_data = get_all_product(product)
+
+    all_product_data[7] = new_cln
+
+    Delete(GetContext, product_id)
+    Put(GetContext, product_id, all_product_data)
+    return True
+
+
+def transfer_license(license_id, new_owner):
+    """
+    transfer license from one user to the other
+
+    :param license_id:
+    :param new_owner:
+    :return: bool
+    """
+    if not is_owner(license_id):
+        return False
+
+    license = init_license(license_id)
+
+    product_id = license.product_id
+    product = init_product(product_id)
+    transferable = product.trans
+
+    # check if the license is still valid
+    license_expiration_height = license.expir
+    height = GetHeight()
+
+    if height > license_expiration_height:
+        print("This license has already expired!")
+        return False
+
+    if not transferable:
+        print("This product does not support transfers")
+        return False
+
+    Delete(GetContext, license_id)
+
+    all_license_data = get_all_license_data(license)
+
+    all_license_data[0] = new_owner
+    Put(GetContext, license_id, all_license_data)
+    return True
+
+
+def purchase_license(product_id):
+    """
+    Some function to allow people to purchase a license for a preset amount of gas/neo/NEP5 token
+    :param product_id:
+    :return: bool
+    """
+    pass
 
 
 def Main(operation, args):
     """
-    Main definition for the smart contracts
+    The body of the contract, all operation go through here.
 
-    :param operation: the operation to be performed
-    :type operation: str
+    :param operation:
+        RegisterProduct :param args: see register_product
+        :return: bool
 
-    :param args: list of arguments.
-        args[0] is always sender script hash
-        args[1] is always product_id
-        args[2] (optional) is always another script hash
-    :param type: str
+        LicenseProduct :param args: see license_product
+        :return: bool
 
-    :return:
-        byterarray: The result of the operation
+        TransferLicense :param args: see transfer_license
+        :return: bool
+
+        GetLicenseInfo: :param args: [license_id]
+        :return: list
+
+        GetProductInfo: :param args: [product_id]
+        :return: list
     """
-    # Am I who I say I am?
-    user_hash = args[0]
-    authorized = CheckWitness(user_hash)
-    if not authorized:
-        print("Not Authorized")
-        return False
-    print("Authorized")
-    # Common definitions
-    product_id = args[1]
-    user_license = concat(user_hash, product_id)
+    if operation == "RegisterProduct":
+        return register_product(args)
 
-    if len(args) == 3:
-        print('License for different user')
-        requested_user = args[2]
-        requested_license = concat(requested_user, product_id)
-    else:
-        print('License for me')
-        requested_user = user_hash
-        requested_license = user_license
+    if operation == "LicenseProduct":
+        return license_product(args)
 
-    if operation != None:
-        if operation == 'RegisterProduct':
-            print('RegisterProduct')
-            product_exists = Get(GetContext, product_id)
-            if not product_exists:
-                Put(GetContext, product_id, user_hash)
-                print("Product Registered")
-                return True
+    if operation == "TransferLicense":
+        license_id = args[0]
+        new_owner = args[1]
+        return transfer_license(license_id, new_owner)
 
-        if operation == 'LicenseProduct':
-            print('LicenseProduct')
-            if is_owner(product_id):
-                # License the product
-                Put(GetContext, requested_license, requested_user)
-                print("Product Licensed")
-                return True
+    if operation == "GetLicenseInfo":
+        license_id = args[0]
+        license = init_license(license_id)
+        res = get_all_license_data(license)
+        return res
 
-        if operation == 'TransferLicense':
-            license_owner = Get(GetContext, user_license)
-            if license_owner:
-                print("License exists")
-                is_license_owner = CheckWitness(license_owner)
-                # Am I the license owner?
-                if is_license_owner:
-                    print("User is License Owner")
-                    # Transfer License
-                    new_user_hash = args[2]
-                    new_license = concat(new_user_hash, product_id)
-                    Delete(GetContext, user_license)
-                    Put(GetContext, new_license, new_user_hash)
-                    print("License Transfered")
-                    return True
-
-        if operation == 'RemoveLicense':
-           # Am I the product owner?
-            if is_owner(product_id):
-                # Delete the license
-                user_hash_to_del = args[2]
-                license_to_del = concat(user_hash_to_del, product_id)
-                Delete(GetContext, license_to_del)
-                return True
-
-        if operation == 'GetLicense':
-            print("GetLicense")
-            license_owner = Get(GetContext, requested_license)
-            if license_owner:
-                return license_owner
-
-        return False
+    if operation == "GetProductInfo":
+        product_id = args[0]
+        product = init_product(product_id)
+        res = get_all_product(product)
+        return res
